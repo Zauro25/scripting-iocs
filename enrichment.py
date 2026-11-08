@@ -1,105 +1,117 @@
+import argparse
+import csv
+import hashlib
+import ipaddress
+import json
 import os
 import re
-import csv
-import json
 import time
-import ipaddress
+
 import requests
 
-API_KEY = os.getenv("VT_API_KEY")
-results = []
+FIELDS = ["ioc", "type", "score", "verdict"]
 
-if not API_KEY:
-    print("VT_API_KEY belum diatur.")
-    exit()
 
-with open("iocs.txt") as f:
-    iocs = set(line.strip() for line in f if line.strip())
-
-for ioc in iocs:
-    # Validasi tipe IOC
+def detect_type(value):
     try:
-        ipaddress.IPv4Address(ioc)
-        ioc_type = "ip_addresses"
+        ipaddress.IPv4Address(value)
+        return "ip_addresses"
     except ValueError:
-        if re.fullmatch(r"[a-fA-F0-9]{32}", ioc):
-            ioc_type = "files"
-        elif re.fullmatch(r"[a-fA-F0-9]{40}", ioc):
-            ioc_type = "files"
-        elif re.fullmatch(r"[a-fA-F0-9]{64}", ioc):
-            ioc_type = "files"
-        elif re.fullmatch(
-            r"(?=.{1,253}$)([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,63}", ioc
-        ):
-            ioc_type = "domains"
-        else:
-            print("IOC tidak valid:", ioc)
-            continue
+        pass
+
+    if re.fullmatch(r"[0-9a-fA-F]{32}|[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", value):
+        return "files"
+
+    normalized = value.lower()
+    if len(normalized) <= 253 and not normalized.endswith("."):
+        labels = normalized.split(".")
+        if len(labels) >= 2 and all(
+            label and len(label) <= 63 and label[0].isalnum()
+            and label[-1].isalnum() and re.fullmatch(r"[a-z0-9-]+", label)
+            for label in labels
+        ) and len(labels[-1]) >= 2:
+            return "domains"
+
+    return None
+
+
+def mock_result(ioc, ioc_type):
+    digest = hashlib.sha256(ioc.encode()).digest()
+    malicious = digest[0] % 5 == 0
+    suspicious = not malicious and digest[1] % 7 == 0
+    return {
+        "ioc": ioc,
+        "type": ioc_type,
+        "score": 100 if malicious else (25 if suspicious else 0),
+        "verdict": "malicious" if malicious else ("suspicious" if suspicious else "clean"),
+    }
+
+
+def enrich(ioc, ioc_type, api_key, retries=2):
+    if not api_key:
+        return mock_result(ioc, ioc_type)
 
     url = f"https://www.virustotal.com/api/v3/{ioc_type}/{ioc}"
-
-    try:
-        response = requests.get(
-            url,
-            headers={"x-apikey": API_KEY},
-            timeout=15
-        )
-
-        if response.status_code == 429:
-            print("Rate limit. Coba lagi nanti:", ioc)
-            continue
-
-        if response.status_code == 404:
-            results.append({
+    headers = {"x-apikey": api_key}
+    for attempt in range(retries + 1):
+        try:
+            response = requests.get(url, headers=headers, timeout=15)
+            if response.status_code == 404:
+                return {"ioc": ioc, "type": ioc_type, "score": None, "verdict": "unknown"}
+            if response.status_code == 429 and attempt < retries:
+                retry_after = response.headers.get("Retry-After", "2")
+                time.sleep(min(float(retry_after), 30))
+                continue
+            response.raise_for_status()
+            stats = response.json()["data"]["attributes"]["last_analysis_stats"]
+            malicious = stats.get("malicious", 0)
+            suspicious = stats.get("suspicious", 0)
+            total = sum(stats.values())
+            return {
                 "ioc": ioc,
                 "type": ioc_type,
-                "score": None,
-                "verdict": "unknown"
-            })
+                "score": round(malicious / total * 100, 2) if total else None,
+                "verdict": "malicious" if malicious else ("suspicious" if suspicious else "clean"),
+            }
+        except (requests.RequestException, ValueError, KeyError) as error:
+            if attempt == retries:
+                print(f"API error untuk {ioc}: {error}")
+                return {"ioc": ioc, "type": ioc_type, "score": None, "verdict": "unknown"}
+            time.sleep(2 ** attempt)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Enrich IP, domain, and file hash IOCs with VirusTotal.")
+    parser.add_argument("--input", default="iocs.txt")
+    parser.add_argument("--json", default="results.json")
+    parser.add_argument("--csv", dest="csv_path", default="results.csv")
+    parser.add_argument("--mock", action="store_true", help="Use deterministic local results without an API call.")
+    args = parser.parse_args()
+
+    with open(args.input, encoding="utf-8") as input_file:
+        iocs = list(dict.fromkeys(line.strip() for line in input_file if line.strip()))
+
+    results = []
+    api_key = os.getenv("VT_API_KEY")
+    if not args.mock and not api_key:
+        parser.error("VT_API_KEY belum diatur. Set API key atau gunakan --mock.")
+    if args.mock:
+        api_key = None
+    for ioc in iocs:
+        ioc_type = detect_type(ioc)
+        if not ioc_type:
+            print("IOC tidak valid:", ioc)
             continue
+        results.append(enrich(ioc, ioc_type, api_key))
 
-        response.raise_for_status()
+    with open(args.json, "w", encoding="utf-8") as output_file:
+        json.dump(results, output_file, indent=2)
+    with open(args.csv_path, "w", newline="", encoding="utf-8") as output_file:
+        writer = csv.DictWriter(output_file, fieldnames=FIELDS)
+        writer.writeheader()
+        writer.writerows(results)
+    print(f"Enrichment selesai: {len(results)} IOC valid.")
 
-        stats = response.json()["data"]["attributes"]["last_analysis_stats"]
-        malicious = stats.get("malicious", 0)
-        suspicious = stats.get("suspicious", 0)
-        total = sum(stats.values())
 
-        score = round(malicious / total * 100, 2) if total else None
-
-        if malicious:
-            verdict = "malicious"
-        elif suspicious:
-            verdict = "suspicious"
-        else:
-            verdict = "clean"
-
-        results.append({
-            "ioc": ioc,
-            "type": ioc_type,
-            "score": score,
-            "verdict": verdict
-        })
-
-    except requests.RequestException as e:
-        print("API error:", e)
-        results.append({
-            "ioc": ioc,
-            "type": ioc_type,
-            "score": None,
-            "verdict": "unknown"
-        })
-
-    time.sleep(16)
-
-with open("results.json", "w") as f:
-    json.dump(results, f, indent=4)
-
-with open("results.csv", "w", newline="") as f:
-    writer = csv.DictWriter(
-        f, fieldnames=["ioc", "type", "score", "verdict"]
-    )
-    writer.writeheader()
-    writer.writerows(results)
-
-print("Enrichment selesai.")
+if __name__ == "__main__":
+    main()
